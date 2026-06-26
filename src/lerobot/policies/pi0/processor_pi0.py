@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any
 
 import torch
@@ -142,7 +143,7 @@ def make_pi0_pre_post_processors(
         AddBatchDimensionProcessorStep(),
         Pi0NewLineProcessor(),  # Add newlines before tokenization for PaliGemma
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=os.environ.get("PI0_TOKENIZER_NAME", "google/paligemma-3b-pt-224"),
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",

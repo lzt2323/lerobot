@@ -16,12 +16,13 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+import os
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
@@ -33,7 +34,6 @@ from lerobot.processor import (
     ProcessorStepRegistry,
     RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
-    TokenizerProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
@@ -41,11 +41,40 @@ from lerobot.processor import (
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_STATE,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_LABELS,
+    OBS_LANGUAGE_SUBTASK_TOKENS,
+    OBS_LANGUAGE_TOKENS,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+from lerobot.utils.import_utils import _transformers_available
 
 from .configuration_pi05 import PI05Config
+
+if TYPE_CHECKING or _transformers_available:
+    from transformers import AutoTokenizer
+else:
+    AutoTokenizer = None
+
+
+PI05_SUBTASK_PROMPT = "pi05_subtask_prompt"
+PI05_SUBTASK_TARGET = "pi05_subtask_target"
+PI05_ACTION_PROMPT_PREFIX = "pi05_action_prompt_prefix"
+PI05_ACTION_PROMPT_SUFFIX = "pi05_action_prompt_suffix"
+
+
+def _as_text_list(value: str | list[str] | tuple[str, ...], *, key: str) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise ValueError(f"{key} must be a string or list of strings, got {type(value)}")
+
+
+def _clean_prompt_text(text: str) -> str:
+    return text.strip().replace("_", " ").replace("\n", " ")
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -57,6 +86,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    subtask_key: str = "subtask"
+    enable_subtask_prediction: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -67,6 +98,20 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
+        tasks = _as_text_list(tasks, key=self.task_key)
+
+        subtasks = None
+        if self.enable_subtask_prediction:
+            subtasks_value = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.subtask_key)
+            if subtasks_value is None:
+                if transition.get(TransitionKey.ACTION) is not None:
+                    raise ValueError(
+                        "PI05 subtask prediction is enabled, but no subtask was found in complementary data"
+                    )
+            else:
+                subtasks = _as_text_list(subtasks_value, key=self.subtask_key)
+                if len(subtasks) != len(tasks):
+                    raise ValueError(f"Expected {len(tasks)} subtasks, got {len(subtasks)}")
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -77,13 +122,34 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
         full_prompts = []
+        subtask_prompts = []
+        subtask_targets = []
+        action_prompt_prefixes = []
+        action_prompt_suffixes = []
         for i, task in enumerate(tasks):
-            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            cleaned_text = _clean_prompt_text(task)
             state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            if self.enable_subtask_prediction:
+                subtask_prompts.append(f"Task: {cleaned_text}, State: {state_str};\nSubtask: ")
+                cleaned_subtask = _clean_prompt_text(subtasks[i]) if subtasks is not None else ""
+                if subtasks is not None:
+                    subtask_targets.append(cleaned_subtask)
+                action_prompt_prefix = f"Task: {cleaned_text}, Subtask: "
+                action_prompt_suffix = f", State: {state_str};\nAction: "
+                full_prompt = f"{action_prompt_prefix}{cleaned_subtask}{action_prompt_suffix}"
+                action_prompt_prefixes.append(action_prompt_prefix)
+                action_prompt_suffixes.append(action_prompt_suffix)
+            else:
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
+        if self.enable_subtask_prediction:
+            transition[TransitionKey.COMPLEMENTARY_DATA][PI05_SUBTASK_PROMPT] = subtask_prompts
+            if subtasks is not None:
+                transition[TransitionKey.COMPLEMENTARY_DATA][PI05_SUBTASK_TARGET] = subtask_targets
+            transition[TransitionKey.COMPLEMENTARY_DATA][PI05_ACTION_PROMPT_PREFIX] = action_prompt_prefixes
+            transition[TransitionKey.COMPLEMENTARY_DATA][PI05_ACTION_PROMPT_SUFFIX] = action_prompt_suffixes
         # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return transition
@@ -94,6 +160,130 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         """
         This step does not alter the feature definitions.
         """
+        return features
+
+
+@ProcessorStepRegistry.register(name="pi05_tokenizer_processor_step")
+@dataclass
+class Pi05TokenizerProcessorStep(ProcessorStep):
+    tokenizer_name: str
+    max_length: int = 200
+    subtask_max_length: int = 128
+    task_key: str = "task"
+    enable_subtask_prediction: bool = False
+    padding_side: str = "right"
+    padding: str = "max_length"
+    truncation: bool = True
+
+    input_tokenizer: Any = None
+
+    def __post_init__(self):
+        if not _transformers_available or AutoTokenizer is None:
+            raise ImportError("transformers is required to use Pi05TokenizerProcessorStep")
+        self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        self.input_tokenizer.padding_side = self.padding_side
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+
+        tasks = _as_text_list(complementary_data.get(self.task_key), key=self.task_key)
+        tokenized_prompt = self._tokenize_text(tasks, max_length=self.max_length)
+        observation[OBS_LANGUAGE_TOKENS] = tokenized_prompt["input_ids"]
+        observation[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_prompt["attention_mask"].to(dtype=torch.bool)
+
+        if self.enable_subtask_prediction:
+            prompts = _as_text_list(complementary_data.get(PI05_SUBTASK_PROMPT), key=PI05_SUBTASK_PROMPT)
+            targets_value = complementary_data.get(PI05_SUBTASK_TARGET)
+            if targets_value is None:
+                tokenized_subtask = self._tokenize_text(prompts, max_length=self.subtask_max_length)
+                subtask_tokens = tokenized_subtask["input_ids"]
+                subtask_masks = tokenized_subtask["attention_mask"].to(dtype=torch.bool)
+                subtask_labels = None
+            else:
+                targets = _as_text_list(targets_value, key=PI05_SUBTASK_TARGET)
+                if len(prompts) != len(targets):
+                    raise ValueError(f"Expected {len(prompts)} subtask targets, got {len(targets)}")
+                subtask_tokens, subtask_masks, subtask_labels = self._tokenize_subtask_lm(prompts, targets)
+            observation[OBS_LANGUAGE_SUBTASK_TOKENS] = subtask_tokens
+            observation[OBS_LANGUAGE_SUBTASK_ATTENTION_MASK] = subtask_masks
+            if subtask_labels is not None:
+                observation[OBS_LANGUAGE_SUBTASK_LABELS] = subtask_labels
+
+        transition[TransitionKey.OBSERVATION] = observation
+        return transition
+
+    def _tokenize_text(self, text: str | list[str], *, max_length: int) -> dict[str, torch.Tensor]:
+        return self.input_tokenizer(
+            text,
+            max_length=max_length,
+            truncation=self.truncation,
+            padding=self.padding,
+            return_tensors="pt",
+        )
+
+    def _tokenize_subtask_lm(
+        self, prompts: list[str], targets: list[str]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        eos_token = self.input_tokenizer.eos_token or ""
+        full_texts = [f"{prompt}{target}{eos_token}" for prompt, target in zip(prompts, targets, strict=True)]
+        tokenized_full = self.input_tokenizer(
+            full_texts,
+            max_length=self.subtask_max_length,
+            truncation=self.truncation,
+            padding=self.padding,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+        )
+        offset_mapping = tokenized_full.pop("offset_mapping")
+
+        labels = tokenized_full["input_ids"].clone()
+        labels[tokenized_full["attention_mask"] == 0] = -100
+        for row, prompt in enumerate(prompts):
+            prompt_len = len(prompt)
+            prompt_or_special = offset_mapping[row, :, 1] <= prompt_len
+            labels[row, prompt_or_special] = -100
+
+        return (
+            tokenized_full["input_ids"],
+            tokenized_full["attention_mask"].to(dtype=torch.bool),
+            labels,
+        )
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "tokenizer_name": self.tokenizer_name,
+            "max_length": self.max_length,
+            "subtask_max_length": self.subtask_max_length,
+            "task_key": self.task_key,
+            "enable_subtask_prediction": self.enable_subtask_prediction,
+            "padding_side": self.padding_side,
+            "padding": self.padding,
+            "truncation": self.truncation,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        if OBS_LANGUAGE_TOKENS not in features[PipelineFeatureType.OBSERVATION]:
+            features[PipelineFeatureType.OBSERVATION][OBS_LANGUAGE_TOKENS] = PolicyFeature(
+                type=FeatureType.LANGUAGE, shape=(self.max_length,)
+            )
+        if OBS_LANGUAGE_ATTENTION_MASK not in features[PipelineFeatureType.OBSERVATION]:
+            features[PipelineFeatureType.OBSERVATION][OBS_LANGUAGE_ATTENTION_MASK] = PolicyFeature(
+                type=FeatureType.LANGUAGE, shape=(self.max_length,)
+            )
+        if self.enable_subtask_prediction:
+            for key in (
+                OBS_LANGUAGE_SUBTASK_TOKENS,
+                OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+                OBS_LANGUAGE_SUBTASK_LABELS,
+            ):
+                if key not in features[PipelineFeatureType.OBSERVATION]:
+                    features[PipelineFeatureType.OBSERVATION][key] = PolicyFeature(
+                        type=FeatureType.LANGUAGE, shape=(self.subtask_max_length,)
+                    )
         return features
 
 
@@ -147,10 +337,15 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
-        TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+        Pi05PrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim,
+            enable_subtask_prediction=config.enable_subtask_prediction,
+        ),
+        Pi05TokenizerProcessorStep(
+            tokenizer_name=os.environ.get("PI0_TOKENIZER_NAME", "google/paligemma-3b-pt-224"),
             max_length=config.tokenizer_max_length,
+            subtask_max_length=config.subtask_tokenizer_max_length,
+            enable_subtask_prediction=config.enable_subtask_prediction,
             padding_side="right",
             padding="max_length",
         ),

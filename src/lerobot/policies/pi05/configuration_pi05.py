@@ -102,6 +102,11 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
+    enable_subtask_prediction: bool = False
+    subtask_loss_weight: float = 1.0
+    subtask_tokenizer_max_length: int = 128
+    subtask_max_new_tokens: int = 32
+    use_predicted_subtask_for_action: bool = True
 
     def __post_init__(self):
         super().__post_init__()

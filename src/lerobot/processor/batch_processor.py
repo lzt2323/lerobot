@@ -163,6 +163,11 @@ class AddBatchDimensionComplementaryDataStep(ComplementaryDataProcessorStep):
             if isinstance(task_value, str):
                 complementary_data["task"] = [task_value]
 
+        if "subtask" in complementary_data:
+            subtask_value = complementary_data["subtask"]
+            if isinstance(subtask_value, str):
+                complementary_data["subtask"] = [subtask_value]
+
         # Process index field - add batch dim if 0D
         if "index" in complementary_data:
             index_value = complementary_data["index"]
@@ -174,6 +179,11 @@ class AddBatchDimensionComplementaryDataStep(ComplementaryDataProcessorStep):
             task_index_value = complementary_data["task_index"]
             if isinstance(task_index_value, Tensor) and task_index_value.dim() == 0:
                 complementary_data["task_index"] = task_index_value.unsqueeze(0)
+
+        if "subtask_index" in complementary_data:
+            subtask_index_value = complementary_data["subtask_index"]
+            if isinstance(subtask_index_value, Tensor) and subtask_index_value.dim() == 0:
+                complementary_data["subtask_index"] = subtask_index_value.unsqueeze(0)
 
         complementary_data.pop("language_persistent", None)
         complementary_data.pop("language_events", None)
